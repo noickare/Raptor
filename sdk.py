@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,24 +8,55 @@ import tiktoken
 import umap
 from bs4 import BeautifulSoup as Soup
 from flask import Flask, jsonify, request
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings import OpenAIEmbeddings
+from langchain import hub
 from langchain.prompts import ChatPromptTemplate
-from langchain.schema.output_parser import StrOutputParser
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain_community.document_loaders import RecursiveUrlLoader
-from langchain_hub import hub
+from langchain.schema import Document
+from langchain_chroma import Chroma
+from langchain_community.document_loaders.recursive_url_loader import \
+    RecursiveUrlLoader
+from langchain_core.embeddings import Embeddings
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from numpy.typing import NDArray
 from sklearn.mixture import GaussianMixture
 
-# prep
+
+def storage(cls):
+    required_methods = ["embed", "get_retriever"]
+
+    for method in required_methods:
+        if not hasattr(cls, method):
+            raise TypeError(f"'{cls.__name__}' must implement the '{method}' method")
+
+    original_init = cls.__init__
+
+    @wraps(cls.__init__)
+    def new_init(self, *args, **kwargs):
+        self.vectorstore = None
+        original_init(self, *args, **kwargs)
+
+    cls.__init__ = new_init
+
+    def check_vectorstore(method):
+        @wraps(method)
+        def wrapper(self, *args, **kwargs):
+            if self.vectorstore is None and method.__name__ == "get_retriever":
+                raise ValueError("You must call embed() before get_retriever()")
+            return method(self, *args, **kwargs)
+
+        return wrapper
+
+    for method_name in required_methods:
+        setattr(cls, method_name, check_vectorstore(getattr(cls, method_name)))
+
+    return cls
 
 
 class Preparaton:
-    def __init__(self, urls_with_depths: list[tuple[str, int]]):
-        self.urls_with_depths = urls_with_depths
+    # def __init__(self, urls_with_depths: list[tuple[str, int]]):
+    #     self.urls_with_depths = urls_with_depths
 
     def num_tokens_from_string(self, string: str, encoding_name: str) -> int:
         """Returns the number of tokens in a text string."""
@@ -41,17 +73,17 @@ class Preparaton:
         docs = loader.load()
         return docs
 
-    def get_docs(self) -> list:
+    def get_docs(self, urls_with_depths: list[tuple[str, int]]) -> list:
         docs = []
 
-        for url, depth in self.urls_with_depths:
+        for url, depth in urls_with_depths:
             fetched_docs = self.get_document(url, depth)
             docs.extend(fetched_docs)
 
         return docs
 
-    def get_concatenated_content(self):
-        docs = self.get_docs()
+    def get_concatenated_content(self, urls_with_depths: list[tuple[str, int]]):
+        docs = get_docs(urls_with_depths)
         docs_texts = [d.page_content for d in docs]
         counts = [self.num_tokens_from_string(d, "cl100k_base") for d in docs_texts]
         d_sorted = sorted(docs, key=lambda x: x.metadata["source"])
@@ -61,13 +93,13 @@ class Preparaton:
         )
         return concatenated_content
 
-    def text_split(self):
+    def text_split(self, urls_with_depths: list[tuple[str, int]]):
         chunk_size_tok = 2000
         text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             chunk_size=chunk_size_tok, chunk_overlap=0
         )
 
-        concatenated_content = self.get_concatenated_content()
+        concatenated_content = self.get_concatenated_content(urls_with_depths)
 
         texts_split = text_splitter.split_text(concatenated_content)
 
@@ -182,27 +214,27 @@ class Preparaton:
 
 
 class Embed:
-    def __init__(self, texts: List[str]):
-        self.texts = texts
+    # def __init__(self, texts: List[str]):
+    #     self.texts = texts
 
     def get_embedding_model(self):
         # can be passed via constructor
         embd = OpenAIEmbeddings()
         return embd
 
-    def embed(self):
+    def embed(self, texts):
         embd = self.get_embedding_model()
-        text_embeddings = embd.embed_documents(self.texts)
+        text_embeddings = embd.embed_documents(texts)
         text_embeddings_np = np.array(text_embeddings)
         return text_embeddings_np
 
-    def embed_cluster_texts(self, clustering_func):
-        text_embeddings_np = self.embed()  # Generate embeddings
+    def embed_cluster_texts(self, clustering_func, texts):
+        text_embeddings_np = self.embed(texts)  # Generate embeddings
         cluster_labels = clustering_func(
             text_embeddings_np, 10, 0.1
         )  # Perform clustering on the embeddings
         df = pd.DataFrame()  # Initialize a DataFrame to store the results
-        df["text"] = self.texts  # Store original texts
+        df["text"] = texts  # Store original texts
         df["embd"] = list(
             text_embeddings_np
         )  # Store embeddings as a list in the DataFrame
@@ -214,11 +246,11 @@ class Embed:
         return "--- --- \n --- --- ".join(unique_txt)
 
     def embed_cluster_summarize_texts(
-        self, texts: List[str], level: int, model: Any
+        self, cluster_func: Any, texts: List[str], level: int, model: Any
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         # Embed and cluster the texts, resulting in a DataFrame with 'text', 'embd', and 'cluster' columns
-        df_clusters = self.embed_cluster_texts(texts)
+        df_clusters = self.embed_cluster_texts(cluster_func, texts)
 
         # Prepare to expand the DataFrame for easier manipulation of clusters
         expanded_list = []
@@ -272,29 +304,17 @@ class Embed:
 
     def recursive_embed_cluster_summarize(
         self,
+        cluster_func,
         texts: List[str],
         model: Any,
         level: int = 1,
         n_levels: int = 3,
     ) -> Dict[int, Tuple[pd.DataFrame, pd.DataFrame]]:
-        """
-        Recursively embeds, clusters, and summarizes texts up to a specified level or until
-        the number of unique clusters becomes 1, storing the results at each level.
-
-        Parameters:
-        - texts: List[str], texts to be processed.
-        - level: int, current recursion level (starts at 1).
-        - n_levels: int, maximum depth of recursion.
-
-        Returns:
-        - Dict[int, Tuple[pd.DataFrame, pd.DataFrame]], a dictionary where keys are the recursion
-        levels and values are tuples containing the clusters DataFrame and summaries DataFrame at that level.
-        """
         results = {}  # Dictionary to store results at each level
 
         # Perform embedding, clustering, and summarization for the current level
         df_clusters, df_summary = self.embed_cluster_summarize_texts(
-            texts, level, model
+            cluster_func, texts, level, model
         )
 
         # Store the results of the current level
@@ -306,7 +326,7 @@ class Embed:
             # Use summaries as the input texts for the next level of recursion
             new_texts = df_summary["summaries"].tolist()
             next_level_results = self.recursive_embed_cluster_summarize(
-                new_texts, level + 1, n_levels
+                cluster_func, new_texts, level + 1, n_levels
             )
 
             # Merge the results from the next level into the current results dictionary
@@ -315,4 +335,110 @@ class Embed:
         return results
 
 
-# class Retriever():
+class Model:
+    def get_model(self):
+        model = ChatOpenAI(temperature=0, model="gpt-4-1106-preview")
+        return model
+
+    def get_embedding_model(self):
+        embd = OpenAIEmbeddings()
+        return embd
+
+
+@storage
+class ChromaStorage:
+    def embed(self, docs: List[Document]) -> None:
+        # Chroma-specific embedding logic
+        docs_texts = [d.page_content for d in docs]
+        leaf_texts = docs_texts
+
+        prep = Preparaton()
+
+        embed = Embed()
+
+        model = Model()
+
+        results = embed.recursive_embed_cluster_summarize(
+            prep.perform_clustering, leaf_texts, model.get_model(), level=1, n_levels=3
+        )
+        all_texts = leaf_texts.copy()
+
+        for level in sorted(results.keys()):
+            # Extract summaries from the current level's DataFrame
+            summaries = results[level][1]["summaries"].tolist()
+            # Extend all_texts with the summaries from the current level
+            all_texts.extend(summaries)
+
+        vectorstore = Chroma.from_texts(
+            texts=all_texts, embedding=model.get_embedding_model()
+        )
+
+        self.vectorstore = vectorstore.as_retriever()
+
+        print(f"Embedded {len(docs)} documents into Chroma")
+
+    def get_retriever(self):
+        return self.vectorstore
+
+
+class Runnable:
+    def __init__(self):
+        self.storage = ChromaStorage()
+
+    def embed_docs(self, urls_with_depths: list[tuple[str, int]]):
+        prep = Preparaton()
+        docs = prep.get_docs(urls_with_depths)
+        self.storage.embed(docs)
+        print("Successful Indexed Document!")
+
+    def format_docs(self, docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    def build_runnable(self):
+        prompt = hub.pull("rlm/rag-prompt")
+
+        model = Model()
+
+        retriever = self.storage.get_retriever()
+
+        rag_chain = (
+            {
+                "context": retriever | self.format_docs,
+                "question": RunnablePassthrough(),
+            }
+            | prompt
+            | model.get_model()
+            | StrOutputParser()
+        )
+
+        return rag_chain
+
+
+def main():
+    prep = Preparaton()
+    runnable = Runnable()
+
+    all_docs = [
+        ("https://python.langchain.com/docs/expression_language/", 20),
+        (
+            "https://python.langchain.com/docs/modules/model_io/output_parsers/quick_start",
+            1,
+        ),
+        (
+            "https://python.langchain.com/docs/modules/data_connection/retrievers/self_query/",
+            1,
+        ),
+    ]
+
+    runnable.embed_docs(all_docs)
+
+    rag_chain = runnable.build_runnable()
+
+    answer = rag_chain.invoke(
+        "How to define a RAG chain? Give me a specific code example."
+    )
+    print("=====================Answer=======================")
+    print(answer)
+
+
+main()

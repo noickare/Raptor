@@ -447,6 +447,8 @@ def build_runnable():
     model = get_model()
     retriever = get_retriever()
 
+    print(retriever)
+
     # Chain
     rag_chain = (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}
